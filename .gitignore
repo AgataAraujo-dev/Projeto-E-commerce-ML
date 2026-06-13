@@ -1,0 +1,15 @@
+# Ambiente Python
+venv/
+
+# Credenciais
+.env
+
+# Arquivos temporários Python
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testes locais
+teste_conexao.py
