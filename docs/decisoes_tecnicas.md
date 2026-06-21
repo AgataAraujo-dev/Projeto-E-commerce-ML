@@ -148,3 +148,79 @@ Alterações em banco de dados não afetam apenas tabelas.
 Views, consultas e modelos dependem da estrutura existente.
 
 Antes de alterar schemas é necessário mapear dependências.
+
+## Consultar múltiplas tabelas em uma única query (WHERE com OR + parênteses)
+
+**Contexto:** Precisávamos confirmar o `data_type` de colunas em duas tabelas
+diferentes (`order_payments_silver_tratada` e `order_reviews`) de uma vez,
+sem rodar duas queries separadas.
+
+**Como funciona:**
+
+```sql
+SELECT table_name, column_name, data_type
+FROM information_schema.columns
+WHERE
+  (table_name = 'order_payments_silver_tratada' AND column_name IN ('payment_sequential', 'payment_installments'))
+  OR
+  (table_name = 'order_reviews' AND column_name IN ('created_at', 'updated_at'))
+ORDER BY table_name, column_name;
+```
+
+**Aprendizado:**
+- `information_schema.columns` é uma tabela de metadados nativa do Postgres —
+  guarda informação sobre todas as colunas do banco (não precisa criar).
+- Para combinar condições de tabelas diferentes numa única query, cada
+  "bloco" de condição (tabela + colunas que eu quero) fica entre parênteses,
+  ligado por `OR`. Os parênteses são essenciais: sem eles, o `AND` interno
+  pode se misturar com o `OR` externo e mudar o resultado (regra de
+  precedência: `AND` "amarra" mais forte que `OR`).
+- `IN ('valor1', 'valor2')` é um atalho para `coluna = 'valor1' OR coluna = 'valor2'`
+  — mais legível quando há vários valores possíveis.
+- `ORDER BY table_name, column_name` não muda o resultado, só a ordem de
+  exibição — útil pra comparar tabelas diferentes lado a lado na tela.
+
+**Quando reusar:** sempre que precisar checar/filtrar colunas (ou outros
+dados) de mais de uma tabela numa query só, em vez de rodar uma query por
+tabela.
+
+## FLOAT vira "double precision" no Postgres — isso é normal
+
+**Contexto:** Ao converter colunas de `products_silver_tratada` de `bigint`
+para `float` (depois revertido para `integer`, ver decisão acima), o Postgres
+mostrava o tipo da coluna como `double precision`, e não como `float`. Parecia
+que o `ALTER` tinha rodado errado, mas não era o caso.
+
+**Aprendizado:**
+- No PostgreSQL, `FLOAT` não é um tipo "de verdade" — é um *alias* (apelido)
+  para outro tipo. Quando escrevemos `TYPE float` sem especificar precisão,
+  o Postgres internamente traduz isso para `double precision`.
+- Ou seja: `ALTER COLUMN x TYPE float` e `ALTER COLUMN x TYPE double precision`
+  fazem exatamente a mesma coisa — só muda o nome usado na hora de escrever o SQL.
+- A regra do guia de boas práticas do projeto ("usar FLOAT, evitar DOUBLE
+  PRECISION") se aplica a **como escrevemos o SQL** (legibilidade e padronização
+  entre o time), não ao que aparece depois numa consulta de metadados
+  (`information_schema.columns`) — isso sempre vai mostrar `double precision`,
+  não tem como evitar.
+- Só existiria diferença real se alguém escrevesse `FLOAT(1)` até `FLOAT(24)`
+  (com precisão especificada) — nesse caso o Postgres usa `real` em vez de
+  `double precision`. Sem precisão especificada, é sempre `double precision`.
+
+**Como confirmar se uma conversão para FLOAT funcionou certo:**
+
+```sql
+SELECT column_name, data_type
+FROM information_schema.columns
+WHERE table_schema = 'silver'
+  AND table_name = 'nome_da_tabela'
+  AND column_name IN ('coluna1', 'coluna2');
+```
+
+Se `data_type` aparecer como `double precision`, está correto — desde que o
+`ALTER COLUMN` original tenha usado `TYPE float` (e não `TYPE numeric` ou
+outro tipo por engano).
+
+**Quando lembrar disso:** toda vez que uma coluna convertida para `FLOAT`
+aparecer como `double precision` numa consulta — não é erro, é o
+comportamento esperado do Postgres.
+
