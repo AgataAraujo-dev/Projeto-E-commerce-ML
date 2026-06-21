@@ -224,3 +224,109 @@ outro tipo por engano).
 aparecer como `double precision` numa consulta — não é erro, é o
 comportamento esperado do Postgres.
 
+## Inconsistência de tipo entre tabelas relacionadas (character varying vs text) — como validar se está perdendo dados
+
+**Contexto:** ao montar a view `vw_tabela_analitica_vendas`, notamos que
+`order_customers.customer_id` é `character varying` enquanto
+`orders_dataset_silver.customer_id` é `text`. As duas tabelas são unidas
+por essa coluna num `JOIN`.
+
+**Aprendizado:**
+- `character varying` e `text` são, na prática, quase idênticos no Postgres
+  — a única diferença real é que `character varying(n)` pode ter limite de
+  tamanho, enquanto `text` não tem. Para `JOIN` e comparação de valores, o
+  Postgres trata os dois como compatíveis, sem erro e sem aviso.
+- **O risco real não está no tipo da coluna — está no conteúdo dela.**
+  Inconsistência de tipo entre tabelas geralmente indica que foram criadas
+  por pessoas diferentes, em momentos diferentes, sem padronização — e isso
+  pode esconder problemas de qualidade de dados como:
+  - espaços em branco sobrando num dos lados (`"abc123 "` vs `"abc123"`)
+  - diferença de maiúsculas/minúsculas (`JOIN` é case-sensitive por padrão)
+  - truncamento silencioso, se algum `varchar(n)` tiver limite menor que o
+    dado real
+- Esses problemas **não geram erro** — o `JOIN` simplesmente não casa
+  aquelas linhas, e elas desaparecem do resultado sem aviso. Para um projeto
+  de ML (ex: cálculo de RFM por cliente), isso pode significar clientes
+  "perdidos" silenciosamente, com histórico de compras incompleto.
+
+**Como confirmar se a inconsistência está causando perda de dados:**
+
+```sql
+-- Total de linhas em cada tabela, isoladamente
+SELECT COUNT(*) AS total_tabela_a FROM schema.tabela_a;
+SELECT COUNT(*) AS total_tabela_b FROM schema.tabela_b;
+
+-- Total de linhas que "casam" no JOIN
+SELECT COUNT(*) AS total_no_join
+FROM schema.tabela_a a
+JOIN schema.tabela_b b ON a.coluna_chave = b.coluna_chave;
+```
+
+Se os três números forem iguais, o `JOIN` está pegando tudo — a
+inconsistência de tipo não está causando perda real. Se `total_no_join` for
+menor que as outras duas, há linhas órfãs para investigar antes de seguir
+(checar espaços, caixa de texto, truncamento).
+
+**Caso real do projeto:** testamos com `order_customers` (99.441 linhas) e
+`orders_dataset_silver` (99.441 linhas) — o `JOIN` também retornou 99.441,
+confirmando que não há perda de dados nessa relação, apesar dos tipos
+diferentes.
+
+**Quando reusar:** sempre que notar tipos diferentes entre colunas usadas
+em `JOIN`, especialmente antes de construir views ou datasets que vão
+alimentar análises ou modelos de ML — validar isso é mais rápido e mais
+seguro do que assumir que "deve estar tudo bem".
+
+## JOIN simples "perdendo" linhas — como descobrir se é erro ou dado real
+
+**Contexto:** ao validar `vw_tabela_analitica_vendas`, o total de linhas veio
+**98.665**, mas esperávamos ~99.441 (número de pedidos confirmado em
+validações anteriores). Susto inicial: "a view está errada?".
+
+**O que causou a diferença:** a view usa `JOIN` (não `LEFT JOIN`) entre
+`orders_dataset_silver`, `order_items` e `order_payments_silver_tratada`.
+`JOIN` simples só traz uma linha no resultado se existir correspondência
+**nas duas tabelas**. Se um pedido não tem nenhum item associado, ou não
+tem pagamento registrado, ele simplesmente desaparece do resultado — sem
+erro, sem aviso.
+
+**Como confirmar se a perda é "dado real" ou "erro de lógica":**
+
+```sql
+-- Pedidos sem correspondência numa tabela relacionada
+SELECT COUNT(*) AS pedidos_sem_X
+FROM silver.orders_dataset_silver o
+LEFT JOIN silver.tabela_relacionada t ON o.order_id = t.order_id
+WHERE t.order_id IS NULL;
+```
+
+Rodar essa query para **cada** tabela usada num `JOIN` simples. Se a soma das
+linhas "sem correspondência" em cada tabela bater com a diferença total
+observada, confirma que a redução é esperada — não é erro, é o `JOIN`
+corretamente excluindo pedidos incompletos.
+
+**Caso real do projeto:** esperado 99.441, view trouxe 98.665 (diferença de
+776). Investigando:
+- pedidos sem pagamento: 1
+- pedidos sem item: 775
+- soma: 776 ✅ — bate exatamente com a diferença, confirmando que não há
+  erro na view.
+
+**Aprendizado:**
+- Nem toda diferença de contagem é bug — pode ser o `JOIN` filtrando
+  corretamente dados incompletos do mundo real (ex: pedido cancelado antes
+  do pagamento, ou sem item associado no dataset original).
+- Isso também explica por que outras views do projeto já tinham filtros
+  explícitos como `WHERE status_pedido <> ALL (ARRAY['canceled', 'unavailable'])`
+  — o time já lidava com essa característica do dataset Olist antes.
+- **Decisão a tomar (verificar com o time/Veronica):** se pedidos sem
+  item/pagamento devem ficar de fora da view (comportamento atual, via
+  `JOIN` simples) ou se deveriam aparecer com valores `NULL`/zerados (nesse
+  caso, trocar para `LEFT JOIN`). Depende do uso que a view vai ter
+  (ex: para RFM, provavelmente faz sentido excluir pedidos sem pagamento).
+
+**Quando reusar:** sempre que uma view com múltiplos `JOIN`s trouxer um
+total de linhas diferente do esperado — antes de assumir que é erro,
+verificar se a diferença é explicada por pedidos sem correspondência em
+alguma das tabelas relacionadas.
+
